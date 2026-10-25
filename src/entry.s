@@ -85,17 +85,18 @@ trap_stack_top:
 .balign 4                        # stvec requires 4-byte alignment (Direct mode)
 
 trap_vector:
-    # Atomically swap sp ↔ sscratch.
-    # After this: sp = trap stack, sscratch = interrupted sp.
-    csrrw sp, sscratch, sp
-
-    addi  sp, sp, -272           # allocate TrapContext (34 registers × 8 bytes)
+    # All tasks are kernel threads running in S-mode, so the trap frame is
+    # pushed onto the interrupted task's OWN stack (like xv6's kernelvec).
+    # A single shared trap stack can't be used once the timer switches tasks:
+    # task A would be parked inside the trap with its frame on that stack, and
+    # the next trap (from task B) would overwrite it.
+    addi  sp, sp, -272           # allocate TrapContext (34 slots x 8 bytes)
 
     # Save t0 first (we need it as scratch immediately).
     sd    t0,  32(sp)
 
-    # Read the original sp out of sscratch and save it.
-    csrr  t0, sscratch
+    # The interrupted sp is just above the frame.
+    addi  t0, sp, 272
     sd    t0,   8(sp)            # TrapContext.sp = interrupted stack pointer
 
     # Save all other registers.
@@ -129,9 +130,24 @@ trap_vector:
     sd    t5, 232(sp)
     sd    t6, 240(sp)
 
+    # sepc and sstatus are per-task state too: if trap_handler switches to
+    # another task, that task's own traps will overwrite these CSRs.
+    csrr  t0, sepc
+    sd    t0, 248(sp)            # TrapContext.sepc
+    csrr  t0, sstatus
+    sd    t0, 256(sp)            # TrapContext.sstatus
+
     # Call the Rust trap handler with a pointer to the TrapContext.
+    # (On a timer interrupt it may switch to another task and only return
+    # here much later, once this task is scheduled again.)
     mv    a0, sp
     call  trap_handler
+
+    # Put back this task's sepc/sstatus (SPP and SPIE decide how sret returns).
+    ld    t0, 248(sp)
+    csrw  sepc, t0
+    ld    t0, 256(sp)
+    csrw  sstatus, t0
 
     # Restore all registers except sp and t0 (handled last).
     ld    ra,   0(sp)
@@ -164,13 +180,8 @@ trap_vector:
     ld    t5, 232(sp)
     ld    t6, 240(sp)
 
-    # Restore sscratch to point back to trap_stack_top (virtual address,
-    # because the MMU is on by the time any trap is handled in kmain).
-    la    t0, trap_stack_top
-    csrw  sscratch, t0
-
-    # Restore t0 and the interrupted sp last.
+    # Restore t0 and pop the frame last.
     ld    t0,  32(sp)
-    ld    sp,   8(sp)
+    addi  sp, sp, 272
 
     sret

@@ -32,25 +32,46 @@ unsafe extern "C" {
     unsafe static _bss_end: usize;
 }
 
+// Busy-wait so each task prints only a few lines per time slice.
+fn delay() {
+    for _ in 0..500000 { unsafe { core::arch::asm!("nop"); } }
+}
+
+// None of these tasks ever call yield_task(): the timer interrupt preempts
+// them when their time slice runs out.
 fn task_a() {
+    let mut count: usize = 0;
     loop {
-        crate::uart::uart_print("Task A is running!\n");
-        
-        // A simple delay so it doesn't spam your terminal too fast
-        for _ in 0..500000 { unsafe { core::arch::asm!("nop"); } }
-        
-        // Hand control back to the scheduler
-        crate::process::yield_task(); 
+        crate::uart::uart_print("Task A is running! iteration ");
+        crate::uart::uart_print_hex(count);
+        crate::uart::uart_print("
+");
+        count += 1;
+        delay();
     }
 }
 
 fn task_b() {
+    let mut count: usize = 0;
     loop {
-        crate::uart::uart_print("Task B is running!\n");
-        
-        for _ in 0..500000 { unsafe { core::arch::asm!("nop"); } }
-        
-        crate::process::yield_task();
+        crate::uart::uart_print("Task B is running! iteration ");
+        crate::uart::uart_print_hex(count);
+        crate::uart::uart_print("
+");
+        count += 1;
+        delay();
+    }
+}
+
+fn task_c() {
+    let mut count: usize = 0;
+    loop {
+        crate::uart::uart_print("Task C is running! iteration ");
+        crate::uart::uart_print_hex(count);
+        crate::uart::uart_print("
+");
+        count += 1;
+        delay();
     }
 }
 #[unsafe(no_mangle)]
@@ -169,20 +190,23 @@ pub extern "C" fn kmain(root_ptr_addr: usize) -> ! {
 
     assert!(trap_addr % 4 == 0, "Trap handler must be 4-byte aligned!");
 
+    // Register kmain as task 0 and create the worker tasks BEFORE interrupts
+    // are enabled, so the first timer tick sees a complete task table.
+    uart::uart_print("Setting up Tasks...
+");
+
+    crate::process::init();
+    crate::process::add_task(task_a);
+    crate::process::add_task(task_b);
+    crate::process::add_task(task_c);
+
     unsafe {
-        let now: usize;
-        core::arch::asm!("rdtime {}", out(reg) now);
-
-        let next: usize = now + 10_000_000;
-
-        core::arch::asm!("csrw stimecmp, {}", in(reg) next);
+        // First time slice starts now.
+        trap::set_next_timer();
         core::arch::asm!("csrw stvec, {}", in(reg) trap_addr);
 
-        uart::uart_print("stvec initalised!\n");
-
-        core::arch::asm!("csrrsi x0, sstatus, 2", options(nostack, nomem));
-
-        uart::uart_print("sstatus initalised!\n");
+        uart::uart_print("stvec initalised!
+");
 
         core::arch::asm!(
             "csrrs x0, sie, {}",
@@ -190,34 +214,36 @@ pub extern "C" fn kmain(root_ptr_addr: usize) -> ! {
             options(nostack, nomem)
         );
 
-        uart::uart_print("STIE initialed\n");
+        uart::uart_print("STIE initialed
+");
+
+        uart::uart_print("Starting Scheduler...
+");
+
+        // Global interrupt enable last: from here on the timer preempts tasks.
+        core::arch::asm!("csrrsi x0, sstatus, 2", options(nostack, nomem));
+
+        uart::uart_print("sstatus initalised!
+");
     }
 
-    uart::uart_print("Trap Handling Enabled!\n");
+    uart::uart_print("Trap Handling Enabled!
+");
 
-    uart::uart_print("Setting up Tasks...\n");
-
-    unsafe {
-        crate::process::TASK_MANAGER.task_num = 1;
-        crate::process::TASK_MANAGER.tasks[0].state = crate::process::TaskState::Running;
-    }
-    crate::process::add_task(task_a);
-    crate::process::add_task(task_b);
-
-    uart::uart_print("Starting Scheduler...\n");
-
+    // kmain is now task 0 and acts as the idle task: it reports ticks and
+    // immediately gives its turn to the next task.
     let mut last_tick: usize = 0;
     loop {
-        let current_tick: usize = TICK_COUNT.load(core::sync::atomic::Ordering::Relaxed);
+        let current_tick: usize = TICK_COUNT.load(Ordering::Relaxed);
         if current_tick != last_tick {
-            uart::uart_print("Tick: ");
+            uart::uart_print("[idle] Tick: ");
             uart::uart_print_hex(current_tick);
-            uart::uart_print("!\n");
+            uart::uart_print("
+");
             last_tick = current_tick;
         }
 
-        // This line runs the scheduler!
-        crate::process::schedule(); 
+        crate::process::yield_task();
     }
 }
 

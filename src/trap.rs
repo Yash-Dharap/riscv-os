@@ -3,6 +3,10 @@ use crate::uart;
 
 use core::sync::atomic::Ordering;
 
+// Length of one round-robin time slice. QEMU virt's timer runs at 10 MHz,
+// so 1_000_000 ticks = 100 ms.
+pub const TIME_SLICE: usize = 1_000_000;
+
 #[repr(C)]
 pub struct TrapContext {
     pub ra: usize,         // offset 0
@@ -10,55 +14,28 @@ pub struct TrapContext {
     pub gp: usize,         // offset 16
     pub tp: usize,         // offset 24
     pub regs: [usize; 27], // t0-t6, a0-a7, s0-s11 (offsets 32-240)
+    pub sepc: usize,       // offset 248 (restored into sepc before sret)
+    pub sstatus: usize,    // offset 256 (restored into sstatus before sret)
+}
+
+// Program the next timer interrupt one time slice from now.
+pub fn set_next_timer() {
+    let now: usize;
+    unsafe {
+        core::arch::asm!("rdtime {}", out(reg) now); //rdtime = pseudo-instruction to read current timer (mtime)
+        core::arch::asm!("csrw stimecmp, {}", in(reg) now + TIME_SLICE);
+    }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn trap_handler(ctx: &TrapContext) -> () {
-    uart::uart_print("\n--- STACK FRAME TRACE ---\n");
-
-    uart::uart_print("RA: ");
-    uart::uart_print_hex(ctx.ra);
-
-    uart::uart_print(" | SP: ");
-    uart::uart_print_hex(ctx.sp);
-
-    // Print t0 (which is regs[0] if your 'sd t0, 32(sp)' is first in the array)
-    uart::uart_print("\nT0: ");
-    uart::uart_print_hex(ctx.regs[0]);
-
-    uart::uart_print("\n-------------------------\n");
-
-    uart::uart_print("TRAP ENTERED\n");
-
+pub extern "C" fn trap_handler(ctx: &mut TrapContext) -> () {
     let scause_value: usize;
-    let mut sepc_value: usize;
     let stval_value: usize;
 
-    uart::uart_print("reading CSRs...\n");
     unsafe {
         core::arch::asm!("csrr {}, scause", out(reg) scause_value);
-        uart::uart_print("scause read\n");
-        core::arch::asm!("csrr {}, sepc",   out(reg) sepc_value);
-        uart::uart_print("sepc read\n");
         core::arch::asm!("csrr {}, stval",  out(reg) stval_value);
-        uart::uart_print("stval read\n");
     }
-
-    uart::uart_print("checking interrupt bit...\n");
-    let is_interrupt: bool = (scause_value >> 63) & 1 == 1;
-
-    uart::uart_print("checking cause code...\n");
-    let cause_code: usize = scause_value & 0xfff;
-
-    uart::uart_print("cause_code: ");
-    uart::uart_print_hex(cause_code);
-    uart::uart_print("\n");
-    uart::uart_print("is_interrupt: ");
-    uart::uart_print(if is_interrupt { "true\n" } else { "false\n" });
-
-    uart::uart_print("SEPC: ");
-    uart::uart_print_hex(sepc_value);
-    uart::uart_print("\n");
 
     let is_interrupt: bool = (scause_value >> 63) & 1 == 1;
     let cause_code: usize = scause_value & 0xfff; //cause code is stored in the low 12 bits
@@ -66,39 +43,24 @@ pub extern "C" fn trap_handler(ctx: &TrapContext) -> () {
     if is_interrupt {
         match cause_code {
             5 => {
-                uart::uart_print("TIMER TRAP\n");
-                uart::uart_print("SEPC: ");
-                uart::uart_print_hex(sepc_value);
-                uart::uart_print("\n");
-
+                // Supervisor timer interrupt: the current task's slice is over.
                 TICK_COUNT.fetch_add(1, Ordering::Relaxed);
 
-                let now: usize;
-                unsafe {
-                    core::arch::asm!("rdtime {}", out(reg) now); //rdtime = pseudo-instruction to read current timer (mtime)
-                }
+                // Re-arm the timer BEFORE switching. Until stimecmp moves
+                // forward the interrupt stays pending, and the next task
+                // would trap again the moment it enabled interrupts.
+                set_next_timer();
 
-                const TIMER_INTERVAL: usize = 10_000_000; //1 second at 10MHz
-                let next: usize = now + TIMER_INTERVAL;
-
-                unsafe {
-                    // core::arch::asm!(
-                    //     "ecall",
-                    //     in("a0") next, // arg0: absolute time
-                    //     in("a6") 0usize, // Function: set_timer (update mtimecmp)
-                    //     in("a7") 0x54494D45usize, // Extension: TIME
-                    //     lateout("a0") _, // stores error value after call
-                    //     lateout("a1") _, // stores return value after call
-                    // );
-
-                    core::arch::asm!("csrw stimecmp, {}", in(reg) next);
-                }
+                // Preempt: put the current task at the back of the queue and
+                // run the next Ready one. Returns when this task is picked again.
+                crate::process::schedule();
             }
 
             _ => {}
         }
     } else {
         //Handle Exceptions (page faults, ecall, etc.)
+        print_trap_diagnostic(ctx, scause_value, stval_value);
 
         match cause_code {
             /*
@@ -107,55 +69,45 @@ pub extern "C" fn trap_handler(ctx: &TrapContext) -> () {
             11: ecall from m-mode
             */
             9 => {
-                let mut sepc_value: usize;
-                unsafe {
-                    core::arch::asm!("csrr {}, sepc", out(reg) sepc_value);
-                    core::arch::asm!("csrw sepc, {}", in(reg) (sepc_value + 4));
-                }
+                ctx.sepc += 4;
             }
             3 => {
                 uart::uart_print("BREAKPOINT HIT - trap handler works!\n");
-                unsafe {
-                    // let sepc: usize;
-                    // core::arch::asm!("csrr {}, sepc", out(reg) sepc);
+                uart::uart_print("Advancing SEPC...\n");
+                advance_sepc(ctx);
 
-                    // let instruction: u16 = core::ptr::read_volatile(sepc as *const u16);
-                    // let step: usize = if (instruction & 0b11) != 0b11 { 2 } else { 4 };
-
-                    // core::arch::asm!("csrw sepc, {}", in(reg) (sepc + step));
-                    uart::uart_print("Advancing SEPC...\n");
-                    advance_sepc();
-                    core::arch::asm!("csrr {}, sepc", out(reg) sepc_value);
-
-                    uart::uart_print("SEPC advancded to: ");
-                    uart::uart_print_hex(sepc_value);
-                    uart::uart_print("\n");
-                }
+                uart::uart_print("SEPC advancded to: ");
+                uart::uart_print_hex(ctx.sepc);
+                uart::uart_print("\n");
             }
             _ => loop {},
         }
     }
+}
 
+fn print_trap_diagnostic(ctx: &TrapContext, scause_value: usize, stval_value: usize) {
     uart::uart_print("\n--- TRAP DIAGNOSTIC ---\n");
     uart::uart_print("SCAUSE: ");
     uart::uart_print_hex(scause_value);
 
     uart::uart_print("\nSEPC  : ");
-    uart::uart_print_hex(sepc_value);
+    uart::uart_print_hex(ctx.sepc);
 
     uart::uart_print("\nSTVAL : ");
     uart::uart_print_hex(stval_value);
-    uart::uart_print("\n-----------------------\n");
 
-    // loop{}
+    uart::uart_print("\nRA    : ");
+    uart::uart_print_hex(ctx.ra);
+
+    uart::uart_print("\nSP    : ");
+    uart::uart_print_hex(ctx.sp);
+    uart::uart_print("\n-----------------------\n");
 }
 
-pub fn advance_sepc() {
-    unsafe {
-        let sepc: usize;
-        core::arch::asm!("csrr {}, sepc", out(reg) sepc);
-        let instruction: u16 = core::ptr::read_volatile(sepc as *const u16);
-        let step: usize = if (instruction & 0b11) != 0b11 { 2 } else { 4 };
-        core::arch::asm!("csrw sepc, {}", in(reg) (sepc + step));
-    }
+// Skip the trapping instruction (2 bytes if compressed, otherwise 4).
+// Works on the saved sepc, which trap_vector writes back before sret.
+pub fn advance_sepc(ctx: &mut TrapContext) {
+    let instruction: u16 = unsafe { core::ptr::read_volatile(ctx.sepc as *const u16) };
+    let step: usize = if (instruction & 0b11) != 0b11 { 2 } else { 4 };
+    ctx.sepc += step;
 }
